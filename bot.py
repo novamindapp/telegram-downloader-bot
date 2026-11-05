@@ -89,8 +89,50 @@ def is_supported(url: str) -> bool:
     )
 
 
+def _download_via_tikwm(url: str, tmpdir: str) -> tuple[str, str]:
+    """Fallback for TikTok when yt-dlp is blocked by TikTok.
+    Uses the TikWM API to get the no-watermark video URL, then downloads it
+    with requests (User-Agent + Referer are required by the TikTok CDN).
+    Tested 2026-11-05 in Muse VM: returns code 0 and a 200 download for ZPLx76411.
+    """
+    import requests
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        "Referer": "https://www.tiktok.com/",
+    }
+    r = requests.get(
+        "https://www.tikwm.com/api/",
+        params={"url": url},
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("code") != 0 or not data.get("data"):
+        raise RuntimeError(f"TikWM API failed: {data.get('msg')}")
+    info = data["data"]
+    play_url = info.get("play")
+    if not play_url:
+        raise RuntimeError("TikWM API returned no video URL")
+    out_path = os.path.join(tmpdir, f"{info.get('id', 'tiktok')}.mp4")
+    with requests.get(play_url, headers=headers, timeout=60, stream=True) as v:
+        v.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in v.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+    if not os.path.exists(out_path) or os.path.getsize(out_path) < 10000:
+        raise RuntimeError("TikWM download produced no file")
+    title = info.get("title") or "Video"
+    logger.info("TikWM fallback succeeded for %s", url)
+    return out_path, title
+
+
 def download_video(url: str, tmpdir: str) -> tuple[str, str]:
-    """Download the video with yt-dlp. Returns (file path, title)."""
+    """Download the video with yt-dlp. Returns (file path, title).
+    TikTok fallback: if yt-dlp fails (TikTok blocks the server IP with
+    'Unexpected response from webpage request'), try TikWM."""
     import yt_dlp
 
     # If a cookies.txt file exists next to bot.py, yt-dlp will use it (important for Instagram)
@@ -105,22 +147,34 @@ def download_video(url: str, tmpdir: str) -> tuple[str, str]:
         "merge_output_format": "mp4",
         "cookiefile": cookiefile,
         # TikTok: yt-dlp returns the version without watermark when available
+        # Note: "impersonate" was tried and made yt-dlp fail in our test venv,
+        # so it is NOT set here - the TikWM fallback below covers blocked IPs.
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+            "Referer": "https://www.tiktok.com/",
+        },
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if info is None:
-            raise RuntimeError("Could not get video info")
-        filename = ydl.prepare_filename(info)
-        # If the video was merged, prepare_filename may not match the real file
-        # Look for the first file in tmpdir
-        if not os.path.exists(filename):
-            files = list(Path(tmpdir).glob("*"))
-            if not files:
-                raise RuntimeError("Download failed, no file found")
-            filename = str(files[0])
-        title = info.get("title") or "Video"
-        return filename, title
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise RuntimeError("Could not get video info")
+            filename = ydl.prepare_filename(info)
+            # If the video was merged, prepare_filename may not match the real file
+            # Look for the first file in tmpdir
+            if not os.path.exists(filename):
+                files = list(Path(tmpdir).glob("*"))
+                if not files:
+                    raise RuntimeError("Download failed, no file found")
+                filename = str(files[0])
+            title = info.get("title") or "Video"
+            return filename, title
+    except Exception as e:
+        logger.warning("yt-dlp failed for %s: %s - trying TikWM fallback", url, e)
+        if "tiktok.com" in url.lower():
+            return _download_via_tikwm(url, tmpdir)
+        raise
 
 
 async def check_channel_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
