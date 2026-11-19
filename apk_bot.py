@@ -17,8 +17,11 @@ v1 scope ONLY:
 
 IMPORTANT:
   * The bot MUST be an Admin of @BotsFamilyOfficial, otherwise
-    Telegram will not reliably tell it who joined, and the
-    membership check fails open (allows the download). See README.
+    Telegram will not reliably tell it who joined. When the
+    membership lookup fails for any reason, the check now FAILS
+    CLOSED (blocks the download) and tells the user the bot
+    needs to be an Admin -- it never lets a non-member through.
+    See README.
   * BOT_TOKEN comes ONLY from the environment (FadeHost env var or
     a local .env file). It is NEVER in this file, NEVER in logs.
 
@@ -95,26 +98,56 @@ HELP_TEXT = (
 )
 
 
-async def is_channel_member(
-    context: ContextTypes.DEFAULT_TYPE, user_id: int
-) -> bool:
-    """True if the user is a member of FORCE_CHANNEL.
+MEMBERSHIP_ERROR_TEXT = (
+    "⚠️ I could not check your channel membership right now.\n\n"
+    "Please make sure the bot is an Admin of the channel, "
+    "then try again."
+)
 
-    NOTE: this only works reliably if the bot is an Admin of the
-    channel. If Telegram itself fails, it returns True (fail open)
-    so a Telegram outage does not block every user -- the README
-    explains why Admin is still required.
+
+async def check_channel_membership(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> str:
+    """Check the user's membership of FORCE_CHANNEL.
+
+    Returns "member", "not_member", or "error".
+
+    FAILS CLOSED: if Telegram cannot answer the lookup (for
+    example the bot is not an Admin of the channel, so Telegram
+    refuses the check), this returns "error" -- never "member".
+    A failed lookup must block the download, not allow it.
+    The full error is logged so the FadeHost console shows why.
     """
     if not FORCE_CHANNEL:
-        return True
+        return "member"
     try:
         member = await context.bot.get_chat_member(
             f"@{FORCE_CHANNEL}", user_id
         )
-        return member.status in ("member", "administrator", "creator")
+        if member.status in ("member", "administrator", "creator"):
+            return "member"
+        return "not_member"
     except Exception as e:
-        logger.warning("channel membership check failed: %s", e)
-        return True
+        logger.error(
+            "channel membership check failed for user %s in @%s: %s",
+            user_id,
+            FORCE_CHANNEL,
+            e,
+            exc_info=True,
+        )
+        return "error"
+
+
+async def is_channel_member(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int
+) -> bool:
+    """True only if the user is a member of FORCE_CHANNEL.
+
+    Kept for compatibility; new code should use
+    check_channel_membership() so a lookup failure ("error")
+    can be told apart from a genuine non-member.
+    """
+    return await check_channel_membership(context, user_id) == "member"
 
 
 def join_keyboard() -> InlineKeyboardMarkup:
@@ -308,14 +341,19 @@ async def do_download(message, user_id: int, details: dict):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if FORCE_CHANNEL and not await is_channel_member(context, user_id):
-        await update.message.reply_text(
-            "👋 Welcome! Before you can download, please join our channel first:\n"
-            f"https://t.me/{FORCE_CHANNEL}\n\n"
-            "Then tap 'I joined, check again' below.",
-            reply_markup=join_keyboard(),
-        )
-        return
+    if FORCE_CHANNEL:
+        status = await check_channel_membership(context, user_id)
+        if status == "error":
+            await update.message.reply_text(MEMBERSHIP_ERROR_TEXT)
+            return
+        if status == "not_member":
+            await update.message.reply_text(
+                "👋 Welcome! Before you can download, please join our channel first:\n"
+                f"https://t.me/{FORCE_CHANNEL}\n\n"
+                "Then tap 'I joined, check again' below.",
+                reply_markup=join_keyboard(),
+            )
+            return
     await update.message.reply_text(WELCOME)
 
 
@@ -331,7 +369,11 @@ async def handle_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please send a shorter app name.")
         return
     user_id = update.effective_user.id
-    if not await is_channel_member(context, user_id):
+    status = await check_channel_membership(context, user_id)
+    if status == "error":
+        await update.message.reply_text(MEMBERSHIP_ERROR_TEXT)
+        return
+    if status == "not_member":
         await send_join_prompt(
             update.message, user_id, {"type": "search", "query": query}
         )
@@ -351,7 +393,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Please send the name of the app you want first."
             )
             return
-        if not await is_channel_member(context, user_id):
+        status = await check_channel_membership(context, user_id)
+        if status == "error":
+            await query.edit_message_text(MEMBERSHIP_ERROR_TEXT)
+            return
+        if status == "not_member":
             await query.edit_message_text(
                 "You have not joined the channel yet.\n"
                 f"Please join first: https://t.me/{FORCE_CHANNEL}\n\n"
@@ -375,7 +421,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "That choice expired. Please send the app name again."
             )
             return
-        if not await is_channel_member(context, user_id):
+        status = await check_channel_membership(context, user_id)
+        if status == "error":
+            await query.edit_message_text(MEMBERSHIP_ERROR_TEXT)
+            return
+        if status == "not_member":
             _pending[user_id] = {"type": "pick", "app": app}
             await query.edit_message_text(
                 "⚠️ Before you can download, please join our channel first:\n"
@@ -394,7 +444,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "That download expired. Please send the app name again."
             )
             return
-        if not await is_channel_member(context, user_id):
+        status = await check_channel_membership(context, user_id)
+        if status == "error":
+            await query.edit_message_text(MEMBERSHIP_ERROR_TEXT)
+            return
+        if status == "not_member":
             await query.edit_message_text(
                 "⚠️ Before you can download, please join our channel first:\n"
                 f"https://t.me/{FORCE_CHANNEL}\n\n"
@@ -406,6 +460,25 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def post_init(app):
+    """Log which bot and channel the membership check uses.
+
+    No token and no user data -- just the bot's own id/username
+    and the channel name, so the FadeHost console shows exactly
+    what is being checked if the join gate ever misbehaves.
+    """
+    try:
+        me = await app.bot.get_me()
+        logger.info(
+            "Bot @%s (id %s) checking membership of @%s",
+            me.username,
+            me.id,
+            FORCE_CHANNEL,
+        )
+    except Exception as e:
+        logger.error("could not read bot identity at startup: %s", e)
+
+
 def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN is missing.")
@@ -414,7 +487,8 @@ def main():
         print("NEVER paste the token in a chat.")
         raise SystemExit(1)
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    logger.info("Force-join channel: @%s", FORCE_CHANNEL)
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CallbackQueryHandler(handle_button))
