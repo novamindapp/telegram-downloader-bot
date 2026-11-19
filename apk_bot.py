@@ -576,7 +576,17 @@ def main():
     )
     # ChatMemberUpdated events are how joins/leaves are tracked --
     # getChatMember('@username') does not work for this channel.
-    app.add_handler(ChatMemberHandler(handle_chat_member))
+    # NOTE: the default ChatMemberHandler only receives MY_CHAT_MEMBER
+    # updates (the bot's OWN status changes), so other users joining
+    # the channel never reached handle_chat_member -- that is why
+    # joins were never recorded. CHAT_MEMBER is required to receive
+    # other members' join/leave updates for the channel.
+    app.add_handler(
+        ChatMemberHandler(
+            handle_chat_member,
+            chat_member_types=ChatMemberHandler.CHAT_MEMBER,
+        )
+    )
 
     print("✅ Bot is running... Send /start to @BotsFamilyApkBot on Telegram")
     app.run_polling(
