@@ -43,7 +43,12 @@ from telegram.ext import (
     filters,
 )
 
-from apkpure import get_app_details, search_apkpure
+from apkpure import (
+    ApkTooBigError,
+    download_apk_file,
+    get_app_details,
+    search_apkpure,
+)
 
 load_dotenv()
 
@@ -64,6 +69,8 @@ FORCE_CHANNEL = (
 _pending: dict[int, dict] = {}
 # Last search results, per user id (for the pick buttons).
 _results: dict[int, list[dict]] = {}
+# Last picked app details, per user id (for the download button).
+_details: dict[int, dict] = {}
 
 WELCOME = (
     "👋 Welcome to All Apk Downloader\n\n"
@@ -71,7 +78,7 @@ WELCOME = (
     "• WhatsApp\n"
     "• Facebook Lite\n"
     "• TikTok\n\n"
-    "I will search APKPure and give you the APK download link.\n\n"
+    "I will search APKPure and send you the APK file here in this chat.\n\n"
     "⚠️ First, you must join our channel:\n"
     f"https://t.me/{FORCE_CHANNEL}"
 )
@@ -82,7 +89,7 @@ HELP_TEXT = (
     f"   https://t.me/{FORCE_CHANNEL}\n"
     "2. Send me the name of the app you want\n"
     "3. Pick the right app from the list\n"
-    "4. Tap 'Download APK' to get it from APKPure\n\n"
+    "4. Tap 'Download APK' to get the APK file here in this chat\n\n"
     "The APK comes from APKPure, not from the Play Store -- "
     "the Play Store does not give APK files directly."
 )
@@ -181,7 +188,7 @@ async def do_search(message, user_id: int, query: str):
 
 
 async def do_pick(message, user_id: int, app: dict):
-    """Fetch the app details and give the APK download link."""
+    """Fetch the app details and offer the APK file download."""
     status = await message.reply_text(
         f"📦 Getting {app['name']} from APKPure..."
     )
@@ -207,12 +214,13 @@ async def do_pick(message, user_id: int, app: dict):
         lines.append(f"Size: {details['size']}")
     lines.append(f"Package: {details['package']}")
     lines.append("")
-    lines.append("Tap 'Download APK' below to get the file from APKPure.")
+    lines.append("Tap 'Download APK' below and I will send you the APK file here in this chat.")
 
+    _details[user_id] = details
     buttons = [
         [
             InlineKeyboardButton(
-                "⬇️ Download APK", url=details["download_url"]
+                "⬇️ Download APK", callback_data="dl"
             )
         ],
         [
@@ -224,6 +232,78 @@ async def do_pick(message, user_id: int, app: dict):
     await status.edit_text(
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons)
     )
+
+
+def _fmt_size(size_bytes: int) -> str:
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    return f"{size_bytes / 1024:.0f} KB"
+
+
+async def do_download(message, user_id: int, details: dict):
+    """Download the APK and send the FILE in this chat.
+
+    Files over 48 MB cannot be sent by a Telegram bot (50 MB limit):
+    in that case say so plainly and give the download link instead.
+    On any download failure, say so and give the link as fallback.
+    The temp file is always deleted after sending.
+    """
+    status = await message.reply_text(
+        f"⬇️ Downloading {details['name']}... please wait."
+    )
+    path = None
+    try:
+        result = await asyncio.to_thread(
+            download_apk_file,
+            details["package"],
+            details.get("slug", ""),
+            details.get("version", ""),
+        )
+        path = result["path"]
+    except ApkTooBigError as e:
+        logger.warning("APK too big for %s: %s bytes", details["package"], e.size_bytes)
+        await status.edit_text(
+            f"⚠️ {details['name']} is too big for Telegram "
+            f"({_fmt_size(e.size_bytes)} -- bots can only send files up to 50 MB).\n\n"
+            "You can still download it here:\n"
+            f"{details['download_url']}"
+        )
+        return
+    except Exception:
+        logger.exception("APK download failed for %s", details["package"])
+        await status.edit_text(
+            "I could not download that APK right now. Please try again in a minute.\n\n"
+            "Or download it yourself here:\n"
+            f"{details['download_url']}"
+        )
+        return
+
+    try:
+        caption_lines = [f"📱 {details['name']}"]
+        if details.get("version"):
+            caption_lines.append(f"Version: {details['version']}")
+        caption_lines.append(f"Size: {_fmt_size(result['size'])}")
+        caption_lines.append(f"Package: {details['package']}")
+        with open(path, "rb") as f:
+            await message.reply_document(
+                document=f,
+                filename=result["filename"],
+                caption="\n".join(caption_lines),
+            )
+        await status.delete()
+    except Exception:
+        logger.exception("Sending APK file failed for %s", details["package"])
+        await status.edit_text(
+            "I downloaded the APK but could not send it here. "
+            "Please try again, or download it yourself:\n"
+            f"{details['download_url']}"
+        )
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -305,6 +385,24 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         await do_pick(query.message, user_id, app)
+        return
+
+    if query.data == "dl":
+        details = _details.get(user_id)
+        if not details:
+            await query.edit_message_text(
+                "That download expired. Please send the app name again."
+            )
+            return
+        if not await is_channel_member(context, user_id):
+            await query.edit_message_text(
+                "⚠️ Before you can download, please join our channel first:\n"
+                f"https://t.me/{FORCE_CHANNEL}\n\n"
+                "Then tap 'I joined, check again' below.",
+                reply_markup=join_keyboard(),
+            )
+            return
+        await do_download(query.message, user_id, details)
         return
 
 

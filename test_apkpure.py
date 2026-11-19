@@ -7,6 +7,8 @@ Run:  python test_apkpure.py
 """
 
 from apkpure import (
+    ApkTooBigError,
+    download_apk_file,
     parse_detail_html,
     parse_play_search_html,
     parse_search_html,
@@ -136,6 +138,70 @@ def test_search_play_fallback():
     print("test_search_play_fallback OK:", [(r["name"], r["package"]) for r in results])
 
 
+
+
+def test_download_apk_file():
+    """download_apk_file() streams a fake APK and returns a real file.
+
+    Fake HEAD says 4 bytes, fake GET streams b'PK' + b'xx'.
+    No network is used.
+    """
+    import os
+
+    class FakeResp:
+        def __init__(self, headers=None, chunks=None):
+            self.status_code = 200
+            self.headers = headers or {}
+            self._chunks = chunks or []
+
+        def raise_for_status(self):
+            pass
+
+        def iter_content(self, chunk_size=1024):
+            yield from self._chunks
+
+    real_head = apkpure.requests.head
+    real_get = apkpure.requests.get
+    apkpure.requests.head = lambda *a, **k: FakeResp({"Content-Length": "4"})
+    apkpure.requests.get = lambda *a, **k: FakeResp(chunks=[b"PK", b"xx"])
+    try:
+        result = download_apk_file("com.facebook.lite", "facebook-lite", "1.0")
+    finally:
+        apkpure.requests.head = real_head
+        apkpure.requests.get = real_get
+    assert result["filename"] == "facebook-lite-1.0.apk", result
+    assert result["size"] == 4, result
+    with open(result["path"], "rb") as f:
+        assert f.read(2) == b"PK", "not a ZIP/APK file"
+    os.unlink(result["path"])
+    print("test_download_apk_file OK:", result["filename"], result["size"])
+
+
+def test_download_too_big():
+    """APKs over 48 MB are refused without downloading the body."""
+    import os
+
+    class FakeResp:
+        status_code = 200
+        headers = {"Content-Length": str(60 * 1024 * 1024)}
+
+        def raise_for_status(self):
+            pass
+
+    real_head = apkpure.requests.head
+    apkpure.requests.head = lambda *a, **k: FakeResp()
+    try:
+        try:
+            download_apk_file("com.example.big", "big-app")
+        except ApkTooBigError as e:
+            assert e.size_bytes == 60 * 1024 * 1024, e.size_bytes
+            print("test_download_too_big OK:", e.size_bytes)
+            return
+        raise AssertionError("expected ApkTooBigError")
+    finally:
+        apkpure.requests.head = real_head
+
+
 if __name__ == "__main__":
     test_search()
     test_search_empty()
@@ -143,4 +209,6 @@ if __name__ == "__main__":
     test_play_search()
     test_slugify()
     test_search_play_fallback()
+    test_download_apk_file()
+    test_download_too_big()
     print("All offline tests passed.")

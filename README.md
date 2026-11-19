@@ -9,7 +9,7 @@ available — a new service costs $20 — so both bots share this one.
 | Bot | File | What it does | Forced-join channel |
 |---|---|---|---|
 | Video Downloader — @tiktok_insta_dl_2026_bot (old) | `bot.py` | User sends a TikTok / Instagram link, bot downloads the video (TikTok without watermark) and sends it back. Adsterra ad gate + 10 free downloads/day. | `tiktok_insta_dl_2026bot` |
-| All Apk Downloader — @BotsFamilyApkBot (new) | `apk_bot.py` + `apkpure.py` | User sends an app name, bot searches APKPure, shows top 5 results, gives the APK download link. No YouTube, no AI chat in v1. | `@BotsFamilyOfficial` |
+| All Apk Downloader — @BotsFamilyApkBot (new) | `apk_bot.py` + `apkpure.py` | User sends an app name, bot searches APKPure, shows top 5 results, and on 'Download APK' sends the APK FILE in the chat (up to 48 MB; bigger APKs get the download link instead). No YouTube, no AI chat in v1. | `@BotsFamilyOfficial` |
 
 Channel for both bots: **Our Bots Family | Наша семья ботов**
 — https://t.me/BotsFamilyOfficial — but the OLD video bot still

@@ -24,7 +24,9 @@ later instead of crashing.
 """
 
 import logging
+import os
 import re
+import tempfile
 import html as html_lib
 
 import requests
@@ -265,6 +267,91 @@ def parse_detail_html(html: str, slug: str, package: str) -> dict:
         # 2026-11-19. The old /download pattern was never live-tested.
         "download_url": DOWNLOAD_URL.format(package=package),
     }
+
+
+# Telegram bots can send files up to 50 MB. Stay just under it so
+# the upload itself never fails on size.
+MAX_APK_BYTES = 48 * 1024 * 1024
+
+
+class ApkTooBigError(Exception):
+    """Raised when the APK is bigger than Telegram's bot file limit."""
+
+    def __init__(self, size_bytes: int):
+        super().__init__(f"APK is {size_bytes} bytes, over the limit")
+        self.size_bytes = size_bytes
+
+
+def _apk_filename(slug: str, package: str, version: str = "") -> str:
+    base = re.sub(r"[^a-z0-9\-]+", "-", (slug or package).lower()).strip("-")
+    if not base:
+        base = package
+    if version:
+        ver = re.sub(r"[^a-z0-9.\-]+", "-", version).strip("-")
+        if ver:
+            return f"{base}-{ver}.apk"
+    return f"{base}.apk"
+
+
+def download_apk_file(
+    package: str,
+    slug: str = "",
+    version: str = "",
+    timeout: int = 120,
+) -> dict:
+    """Download the APK file for a package from APKPure's file host.
+
+    Streams to a temp file so a big APK never sits in memory.
+    Checks Content-Length first and aborts mid-download if the file
+    grows past MAX_APK_BYTES (48 MB, just under Telegram's 50 MB
+    bot limit), deleting the partial file and raising ApkTooBigError.
+    Returns {"path", "size", "filename", "url"}. The caller MUST
+    delete the temp file after sending it.
+    """
+    url = DOWNLOAD_URL.format(package=package)
+    filename = _apk_filename(slug, package, version)
+
+    size_hint = 0
+    try:
+        head = requests.head(
+            url, headers=HEADERS, timeout=30, allow_redirects=True
+        )
+        if head.status_code < 400:
+            size_hint = int(head.headers.get("Content-Length") or 0)
+    except Exception as e:
+        logger.warning("APK HEAD failed for %s: %s", package, e)
+    if size_hint and size_hint > MAX_APK_BYTES:
+        raise ApkTooBigError(size_hint)
+
+    fd, path = tempfile.mkstemp(prefix="apk-", suffix=".apk")
+    size = 0
+    try:
+        with os.fdopen(fd, "wb") as f:
+            resp = requests.get(
+                url, headers=HEADERS, timeout=timeout,
+                stream=True, allow_redirects=True,
+            )
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                size += len(chunk)
+                if size > MAX_APK_BYTES:
+                    raise ApkTooBigError(size)
+                f.write(chunk)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    if size == 0:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise ValueError(f"Downloaded APK for {package} is empty")
+    return {"path": path, "size": size, "filename": filename, "url": url}
 
 
 def get_app_details(slug: str, package: str) -> dict:
