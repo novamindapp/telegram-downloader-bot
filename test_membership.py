@@ -1,17 +1,16 @@
 """Offline tests for the forced-join membership check -- no network,
 no token.
 
-The check must FAIL CLOSED: if Telegram cannot answer the lookup
-(e.g. the bot is not an Admin of the channel), a non-member must
-NOT get through. Regression test for 2026-11-19, when a second
-number that never joined @BotsFamilyOfficial still got the APK
-because the old check returned True on any exception.
+The check is EXACTLY like the TikTok bot's
+(@tiktok_insta_dl_2026_bot): get_chat_member, True only for
+member/administrator/creator, and on ANY exception return True
+(fail open) so a Telegram lookup failure never blocks the user.
+There is no 'error' state and no Admin-error message to users.
 
 Run:  python test_membership.py
 """
 
 import asyncio
-
 import os
 
 # bots-family-apk-bot names the file bot.py, telegram-downloader-bot
@@ -69,50 +68,39 @@ class FakeUpdate:
 
 def test_member_allowed():
     ctx = FakeContext(FakeBot("member"))
-    status = asyncio.run(
-        apk_bot_mod.check_channel_membership(ctx, 12345)
-    )
-    assert status == "member", status
     assert asyncio.run(apk_bot_mod.is_channel_member(ctx, 12345)) is True
     print("test_member_allowed OK")
 
 
 def test_left_is_not_member():
     ctx = FakeContext(FakeBot("left"))
-    status = asyncio.run(
-        apk_bot_mod.check_channel_membership(ctx, 12345)
-    )
-    assert status == "not_member", status
     assert asyncio.run(apk_bot_mod.is_channel_member(ctx, 12345)) is False
     print("test_left_is_not_member OK")
 
 
-def test_lookup_error_fails_closed():
-    """get_chat_member raising must NOT let the user through."""
+def test_lookup_error_fails_open():
+    """Like the TikTok bot: if Telegram itself fails the lookup
+    (e.g. 'Member list is inaccessible'), do NOT block the user."""
     ctx = FakeContext(
-        FakeBot(Exception("Forbidden: bot is not a member of the channel"))
+        FakeBot(Exception("Bad Request: Member list is inaccessible"))
     )
-    status = asyncio.run(
-        apk_bot_mod.check_channel_membership(ctx, 12345)
-    )
-    assert status == "error", status
-    assert asyncio.run(apk_bot_mod.is_channel_member(ctx, 12345)) is False
-    print("test_lookup_error_fails_closed OK")
+    assert asyncio.run(apk_bot_mod.is_channel_member(ctx, 12345)) is True
+    print("test_lookup_error_fails_open OK")
 
 
-def test_start_shows_error_not_welcome():
-    """On a lookup error /start must show the Admin error, not WELCOME."""
+def test_start_on_lookup_error_shows_welcome():
+    """On a lookup error /start shows WELCOME, never an Admin
+    error message (there is no such message any more)."""
     ctx = FakeContext(
-        FakeBot(Exception("Bad Request: chat not found"))
+        FakeBot(Exception("Bad Request: Member list is inaccessible"))
     )
     message = FakeMessage()
     update = FakeUpdate(message)
     asyncio.run(apk_bot_mod.start(update, ctx))
     assert len(message.replies) == 1, message.replies
-    assert "could not check your channel membership" in message.replies[0]
-    assert "Admin of the channel" in message.replies[0]
-    assert "Welcome to All Apk Downloader" not in message.replies[0]
-    print("test_start_shows_error_not_welcome OK")
+    assert "Welcome to All Apk Downloader" in message.replies[0]
+    assert "could not check your channel membership" not in message.replies[0]
+    print("test_start_on_lookup_error_shows_welcome OK")
 
 
 def test_start_non_member_gets_join_prompt():
@@ -129,7 +117,7 @@ def test_start_non_member_gets_join_prompt():
 if __name__ == "__main__":
     test_member_allowed()
     test_left_is_not_member()
-    test_lookup_error_fails_closed()
-    test_start_shows_error_not_welcome()
+    test_lookup_error_fails_open()
+    test_start_on_lookup_error_shows_welcome()
     test_start_non_member_gets_join_prompt()
     print("All membership tests passed.")
