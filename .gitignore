@@ -1,4 +1,5 @@
 .env
+members.json
 __pycache__/
 *.pyc
 *.mp4

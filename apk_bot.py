@@ -16,13 +16,21 @@ v1 scope ONLY:
   * NO YouTube downloads, NO YouTube search, NO AI chat in v1.
 
 IMPORTANT:
-  * The bot MUST be an Admin of @BotsFamilyOfficial, otherwise
-    Telegram will not reliably tell it who joined.
-  * The membership check is exactly like the TikTok bot's
-    (@tiktok_insta_dl_2026_bot): getChatMember, True only for
-    member/administrator/creator, and if Telegram itself fails
-    the check it returns True (fail open) so the user is not
-    blocked -- the user asked for it to work like that bot.
+  * The bot MUST be an Admin of @BotsFamilyOfficial.
+  * getChatMember('@BotsFamilyOfficial') does NOT work for this
+    channel: Telegram ALWAYS fails it with "Member list is
+    inaccessible", even for the channel creator. So the check
+    does NOT rely on that call alone (and never fails open):
+      - At startup the bot resolves the channel to its numeric
+        id and seeds the member set from getChatAdministrators
+        (covers the owner/creator).
+      - Joins/leaves are tracked from ChatMemberUpdated events
+        and persisted in members.json next to this file.
+      - A membership check first looks in that local set, then
+        tries getChatMember with the NUMERIC channel id.
+      - If the lookup still fails, the user gets the normal
+        join prompt -- never an Admin-error message and never
+        a free download.
   * BOT_TOKEN comes ONLY from the environment (FadeHost env var or
     a local .env file). It is NEVER in this file, NEVER in logs.
 
@@ -33,14 +41,17 @@ Run:
 """
 
 import asyncio
+import json
 import logging
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -66,6 +77,61 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 FORCE_CHANNEL = (
     os.getenv("FORCE_CHANNEL", "BotsFamilyOfficial").strip().lstrip("@")
 )
+
+# --- Forced-join membership tracking -------------------------------------
+# getChatMember('@BotsFamilyOfficial') always fails for this channel
+# ("Member list is inaccessible", even for the channel creator), so
+# the bot keeps its own member set instead of asking Telegram on
+# every check:
+#   * seeded at startup from getChatAdministrators (owner/creator),
+#   * updated from ChatMemberUpdated events (join / leave),
+#   * persisted in members.json next to this file (atomic writes),
+#   * getChatMember with the NUMERIC channel id is only a fallback.
+MEMBERS_FILE = Path(__file__).with_name("members.json")
+_MEMBER_STATUSES = ("member", "administrator", "creator", "restricted")
+_members: set[int] = set()
+_channel_id: int | None = None
+
+
+def _load_members() -> None:
+    """Load the persisted member set (empty if the file is missing)."""
+    global _members
+    try:
+        data = json.loads(Path(MEMBERS_FILE).read_text(encoding="utf-8"))
+        _members = {int(uid) for uid in data}
+    except FileNotFoundError:
+        _members = set()
+    except Exception as e:
+        logger.warning("could not load %s: %s", MEMBERS_FILE, e)
+        _members = set()
+
+
+def _save_members() -> None:
+    """Persist the member set atomically (temp file + replace)."""
+    try:
+        path = Path(MEMBERS_FILE)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(sorted(_members)), encoding="utf-8"
+        )
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning("could not save %s: %s", MEMBERS_FILE, e)
+
+
+def _add_member(user_id: int) -> None:
+    if user_id not in _members:
+        _members.add(user_id)
+        _save_members()
+
+
+def _remove_member(user_id: int) -> None:
+    if user_id in _members:
+        _members.discard(user_id)
+        _save_members()
+
+
+_load_members()
 
 # In-memory state, per user id:
 #   {"type": "search", "query": "..."}  -- search waiting for a join
@@ -102,23 +168,55 @@ HELP_TEXT = (
 async def is_channel_member(
     context: ContextTypes.DEFAULT_TYPE, user_id: int
 ) -> bool:
-    """If FORCE_CHANNEL is set, check that the user joined the channel.
+    """True if the user is a member of FORCE_CHANNEL. Never fails open.
 
-    Same behaviour as the TikTok bot (@tiktok_insta_dl_2026_bot):
-    True only for member/administrator/creator, and if Telegram
-    itself fails the lookup, return True so the user is not
-    blocked.
+    Order: (a) the locally tracked member set, (b) getChatMember
+    with the NUMERIC channel id, (c) any lookup failure means
+    "not a member" -- the caller shows the normal join prompt.
+    A successful lookup adds the user to the local set.
     """
     if not FORCE_CHANNEL:
         return True
+    if user_id in _members:
+        return True
+    chat_id = _channel_id if _channel_id is not None else f"@{FORCE_CHANNEL}"
     try:
-        member = await context.bot.get_chat_member(
-            f"@{FORCE_CHANNEL}", user_id
-        )
-        return member.status in ("member", "administrator", "creator")
+        member = await context.bot.get_chat_member(chat_id, user_id)
     except Exception as e:
-        logger.warning("check channel failed: %s", e)
-        return True  # If Telegram itself fails, do not block the user
+        logger.warning("channel membership check failed: %s", e)
+        return False
+    if member.status in _MEMBER_STATUSES:
+        _add_member(user_id)
+        return True
+    return False
+
+
+async def handle_chat_member(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    """Track channel joins/leaves from ChatMemberUpdated events.
+
+    Only updates for FORCE_CHANNEL are used. A join (member /
+    administrator / creator / restricted) adds the user to the
+    local member set; a leave / kick removes them. This is what
+    makes the join gate work even though getChatMember with the
+    @username always fails for this channel.
+    """
+    cm = update.chat_member
+    if cm is None:
+        return
+    chat = cm.chat
+    if _channel_id is not None:
+        if chat.id != _channel_id:
+            return
+    elif getattr(chat, "username", None) != FORCE_CHANNEL:
+        return
+    new_member = cm.new_chat_member
+    user_id = new_member.user.id
+    if new_member.status in _MEMBER_STATUSES:
+        _add_member(user_id)
+    elif new_member.status in ("left", "kicked"):
+        _remove_member(user_id)
 
 
 def join_keyboard() -> InlineKeyboardMarkup:
@@ -411,12 +509,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app):
-    """Log which bot and channel the membership check uses.
+    """Log which bot and channel the membership check uses, resolve
+    the channel to its numeric id, and seed the member set from
+    the channel administrators (this covers the owner/creator,
+    whose join event will never arrive).
 
-    No token and no user data -- just the bot's own id/username
-    and the channel name, so the FadeHost console shows exactly
-    what is being checked if the join gate ever misbehaves.
+    No token and no user data in the logs -- just the bot's own
+    id/username, the channel name/id, and how many admins were
+    seeded, so the FadeHost console shows exactly what is being
+    checked if the join gate ever misbehaves.
     """
+    global _channel_id
     try:
         me = await app.bot.get_me()
         logger.info(
@@ -427,6 +530,32 @@ async def post_init(app):
         )
     except Exception as e:
         logger.error("could not read bot identity at startup: %s", e)
+    if not FORCE_CHANNEL:
+        return
+    try:
+        chat = await app.bot.get_chat(f"@{FORCE_CHANNEL}")
+        _channel_id = chat.id
+        logger.info(
+            "Force-join channel @%s resolved to id %s",
+            FORCE_CHANNEL,
+            _channel_id,
+        )
+    except Exception as e:
+        logger.error(
+            "could not resolve @%s to a channel id: %s", FORCE_CHANNEL, e
+        )
+        return
+    try:
+        admins = await app.bot.get_chat_administrators(_channel_id)
+        seeded = 0
+        for admin in admins:
+            _add_member(admin.user.id)
+            seeded += 1
+        logger.info("Seeded %d channel administrators as members", seeded)
+    except Exception as e:
+        logger.error(
+            "could not list administrators of @%s: %s", FORCE_CHANNEL, e
+        )
 
 
 def main():
@@ -445,9 +574,14 @@ def main():
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search)
     )
+    # ChatMemberUpdated events are how joins/leaves are tracked --
+    # getChatMember('@username') does not work for this channel.
+    app.add_handler(ChatMemberHandler(handle_chat_member))
 
     print("✅ Bot is running... Send /start to @BotsFamilyApkBot on Telegram")
-    app.run_polling()
+    app.run_polling(
+        allowed_updates=["message", "callback_query", "chat_member"]
+    )
 
 
 if __name__ == "__main__":
